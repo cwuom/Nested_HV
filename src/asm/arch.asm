@@ -82,31 +82,45 @@ HvRestoreStateAndReturn proc
 
     xor ecx, ecx
     xgetbv
-
     xrstor [rbx]
 
     mov rax, [rbx + 1000h]
+    mov rcx, [rbx + 1008h]
     mov rdx, [rbx + 1010h]
-
-    mov rbp, [rbx + 1020h]
-    mov rsi, [rbx + 1028h]
-    mov rdi, [rbx + 1030h]
     mov r8,  [rbx + 1038h]
     mov r9,  [rbx + 1040h]
-
+    mov r10, [rbx + 1048h]
+    mov r11, [rbx + 1050h]
     mov r12, [rbx + 1058h]
     mov r13, [rbx + 1060h]
     mov r14, [rbx + 1068h]
     mov r15, [rbx + 1070h]
+    mov rbp, [rbx + 1020h]
+    mov rsi, [rbx + 1028h]
+    mov rdi, [rbx + 1030h]
 
-    mov r10, [rbx + 1078h] ; GuestRip
-    mov r11, [rbx + 1080h] ; GuestRsp
+    mov rax, [rbx + 1018h]
 
-    mov rcx, [rbx + 1008h]
-    mov rbx, [rbx + 1018h]
+    mov dx, ss
+    movzx rdx, dx
+    push rdx
 
-    mov rsp, r11
-    jmp r10
+    mov rdx, [rbx + 1080h]
+    push rdx
+
+    mov rdx, [rbx + 1088h]
+    push rdx
+
+    mov dx, cs
+    movzx rdx, dx
+    push rdx
+
+    mov rdx, [rbx + 1078h]
+    push rdx
+
+    mov rbx, rax
+
+    iretq
 HvRestoreStateAndReturn endp
 
 ; standard VMX intrinsics
@@ -225,6 +239,9 @@ GetRflags endp
 ; u32 HvGetSegmentLimit(u16 Selector)
 HvGetSegmentLimit proc
     lsl eax, ecx
+    jz  Success
+    xor eax, eax
+Success:
     ret
 HvGetSegmentLimit endp
 

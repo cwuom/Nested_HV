@@ -16,16 +16,21 @@
 
 extern "C" void StopHypervisor();
 
+extern "C" {
+    NTKERNELAPI VOID KeStackAttachProcess(PRKPROCESS Process, PVOID ApcState);
+    NTKERNELAPI VOID KeUnstackDetachProcess(PVOID ApcState);
+}
+
 // ==============================================================================
 // External Assembly Linking
 // ==============================================================================
 extern "C" {
     // defined in arch.asm
-    void HvVmxOn(u64* Phys);
+    u64 HvVmxOn(u64* Phys);
     void HvVmxOff();
-    void HvVmClear(u64* Phys);
-    void HvVmPtrLd(u64* Phys);
-    void HvVmWrite(u64 Field, u64 Value);
+    u64 HvVmClear(u64* Phys);
+    u64 HvVmPtrLd(u64* Phys);
+    u64 HvVmWrite(u64 Field, u64 Value);
     u64  HvVmRead(u64 Field);
 
     u64 HvLaunchGuest();
@@ -50,11 +55,15 @@ extern "C" {
 // ==============================================================================
 VcpuContext* g_VcpuData = nullptr;
 u32 g_ProcessorCount = 0;
+static u64 g_HostCr3 = 0;
 
 // tags for memory allocation (avoid multi-char warnings by using integers)
 constexpr u32 TAG_HV00 = 0x30305648; // 'HV00' little endian
 constexpr u32 TAG_HVST = 0x54535648; // 'HVST' little endian
 
+static __forceinline bool VmxOk(u64 rflags) {
+    return ((rflags & 1ULL) == 0) && ((rflags & (1ULL << 6)) == 0);
+}
 // ==============================================================================
 // Helper Functions
 // ==============================================================================
@@ -151,6 +160,99 @@ void HandleMsrWrite(GuestContext* Ctx) {
     }
 }
 
+static __forceinline u64 GetGpr(const GuestContext* c, u8 reg) {
+    switch (reg) {
+        case 0: return c->Rax; case 1: return c->Rcx; case 2: return c->Rdx; case 3: return c->Rbx;
+        case 4: return c->GuestRsp; case 5: return c->Rbp; case 6: return c->Rsi; case 7: return c->Rdi;
+        case 8: return c->R8;  case 9: return c->R9;  case 10: return c->R10; case 11: return c->R11;
+        case 12: return c->R12; case 13: return c->R13; case 14: return c->R14; case 15: return c->R15;
+        default: return 0;
+    }
+}
+
+static __forceinline void SetGpr(GuestContext* c, u8 reg, u64 v) {
+    switch (reg) {
+        case 0:
+            c->Rax = v;
+            break;
+        case 1:
+            c->Rcx = v;
+            break;
+        case 2:
+            c->Rdx = v;
+            break;
+        case 3:
+            c->Rbx = v;
+            break;
+        case 4:
+            c->GuestRsp = v;
+            HvVmWrite(GUEST_RSP, v);
+            break;
+        case 5:
+            c->Rbp = v;
+            break;
+        case 6: c->Rsi = v;
+            break;
+        case 7:
+            c->Rdi = v;
+            break;
+        case 8:
+            c->R8 = v;
+            break;
+        case 9:
+            c->R9 = v;
+            break;
+        case 10:
+            c->R10 = v;
+            break;
+        case 11:
+            c->R11 = v;
+            break;
+        case 12:
+            c->R12 = v;
+            break;
+        case 13:
+            c->R13 = v;
+            break;
+        case 14: c->R14 = v;
+            break;
+        case 15:
+            c->R15 = v;
+            break;
+        default:
+            break;
+    }
+}
+
+static void HandleCrAccess(GuestContext* c) {
+    const u64 qual = HvVmRead(EXIT_QUALIFICATION);
+    const u8 crNum = static_cast<u8>(qual & 0xF);
+    const u8 accessType = static_cast<u8>((qual >> 4) & 0x3);
+    const u8 gpr = static_cast<u8>((qual >> 8) & 0xF);
+
+    if (accessType == 0) {
+        const u64 value = GetGpr(c, gpr);
+        if (crNum == 0) {
+            const u64 newCr0 = AdjustCr0(value);
+            HvVmWrite(GUEST_CR0, newCr0);
+            HvVmWrite(CONTROL_CR0_READ_SHADOW, newCr0);
+            return;
+        }
+        if (crNum == 4) {
+            const u64 actualCr4 = AdjustCr4(value | CR4_VMXE);
+            HvVmWrite(GUEST_CR4, actualCr4);
+            HvVmWrite(CONTROL_CR4_READ_SHADOW, (value & ~CR4_VMXE));
+            return;
+        }
+        return;
+    }
+    if (accessType == 1) {
+        if (crNum == 0) { SetGpr(c, gpr, HvVmRead(GUEST_CR0)); return; }
+        if (crNum == 4) { SetGpr(c, gpr, HvVmRead(CONTROL_CR4_READ_SHADOW)); return; }
+        return;
+    }
+}
+
 extern "C" void VmExitHandler(GuestContext* Ctx) {
     const u64 ExitReason = HvVmRead(VM_EXIT_REASON) & 0xFFFF;
     const u64 ExitLen    = HvVmRead(VM_EXIT_INSTRUCTION_LEN);
@@ -198,6 +300,10 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
 
         case 32: // WRMSR
             HandleMsrWrite(Ctx);
+            break;
+
+        case 28: // control-register access
+            HandleCrAccess(Ctx);
             break;
 
         case 1: // external interrupt
@@ -248,21 +354,18 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     HvVmWrite(HOST_CR0, __readcr0());
 
     // set host CR3 to system directory table base
-    const PEPROCESS SystemProcess = PsInitialSystemProcess;
-    // offset 0x28 is strictly for valid Windows versions
-    u64 SystemCr3 = *reinterpret_cast<u64*>(reinterpret_cast<u8*>(SystemProcess) + 0x28);
-    HvVmWrite(HOST_CR3, SystemCr3);
+    HvVmWrite(HOST_CR3, g_HostCr3);
 
     HvVmWrite(HOST_CR4, __readcr4());
 
     // host selectors
-    HvVmWrite(HOST_CS_SELECTOR, GetCs() & 0xF8);
-    HvVmWrite(HOST_SS_SELECTOR, GetSs() & 0xF8);
-    HvVmWrite(HOST_DS_SELECTOR, GetDs() & 0xF8);
-    HvVmWrite(HOST_ES_SELECTOR, GetEs() & 0xF8);
-    HvVmWrite(HOST_FS_SELECTOR, GetFs() & 0xF8);
-    HvVmWrite(HOST_GS_SELECTOR, GetGs() & 0xF8);
-    HvVmWrite(HOST_TR_SELECTOR, trSelector & 0xF8);
+    HvVmWrite(HOST_CS_SELECTOR, GetCs() & 0xFFF8);
+    HvVmWrite(HOST_SS_SELECTOR, GetSs() & 0xFFF8);
+    HvVmWrite(HOST_DS_SELECTOR, GetDs() & 0xFFF8);
+    HvVmWrite(HOST_ES_SELECTOR, GetEs() & 0xFFF8);
+    HvVmWrite(HOST_FS_SELECTOR, GetFs() & 0xFFF8);
+    HvVmWrite(HOST_GS_SELECTOR, GetGs() & 0xFFF8);
+    HvVmWrite(HOST_TR_SELECTOR, trSelector & 0xFFF8);
 
     // host base addresses
     HvVmWrite(HOST_FS_BASE, __readmsr(MSR_FS_BASE));
@@ -348,10 +451,13 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     HvVmWrite(GUEST_PAT, pat);
     HvVmWrite(HOST_PAT, pat);
 
-    // guest execution state
+ // guest execution state
     HvVmWrite(GUEST_ACTIVITY_STATE, 0); // 0 = Active
     HvVmWrite(GUEST_INTERRUPTIBILITY_INFO, 0);
     HvVmWrite(GUEST_VMCS_LINK_PTR, ~0ULL); // Must be -1
+    HvVmWrite(GUEST_DEBUGCTL, 0);
+    HvVmWrite(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+    HvVmWrite(GUEST_SM_BASE, 0);
 
     // guest RIP/RSP
     HvVmWrite(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
@@ -362,8 +468,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // VM Execution Controls
     // ==============================================================================
 
-    u32 pinCtl = AdjustControls(0, MSR_IA32_VMX_TRUE_PINBASED_CTLS);
-    pinCtl &= ~(1 << 0);
+    u32 pinCtl = 0;
+    pinCtl = AdjustControls(pinCtl, MSR_IA32_VMX_TRUE_PINBASED_CTLS);
     HvVmWrite(CONTROL_PIN_BASED_VM_EXECUTION_CONTROLS, pinCtl);
 
     // Bit 28: Use MSR Bitmaps
@@ -393,12 +499,20 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     HvVmWrite(CONTROL_VM_ENTRY_CONTROLS, entryCtl);
 
     // Set CR0/CR4 Guest/Host Masks
-    HvVmWrite(CONTROL_CR0_GUEST_HOST_MASK, 0xFFFFFFFF); // watch all CR0 bits
-    HvVmWrite(CONTROL_CR4_GUEST_HOST_MASK, 0xFFFFFFFF); // watch all CR4 bits
+    const u64 guestCr0 = AdjustCr0(__readcr0());
+    const u64 guestCr4 = AdjustCr4(__readcr4());
+
+    HvVmWrite(GUEST_CR0, guestCr0);
+    HvVmWrite(GUEST_CR4, guestCr4);
+
+    HvVmWrite(CONTROL_CR0_GUEST_HOST_MASK, 0ULL);
+    HvVmWrite(CONTROL_CR0_READ_SHADOW, guestCr0);
+
+    HvVmWrite(CONTROL_CR4_GUEST_HOST_MASK, CR4_VMXE);
+    HvVmWrite(CONTROL_CR4_READ_SHADOW, guestCr4 & ~CR4_VMXE);
 
     return true;
 }
-
 // ==============================================================================
 // Launch Logic
 // ==============================================================================
@@ -410,21 +524,44 @@ ULONG_PTR EnableHvCallback(ULONG_PTR Context) {
     const u32 id = KeGetCurrentProcessorNumber();
     VcpuContext* vcpu = &g_VcpuData[id];
 
-    __writecr4(__readcr4() | CR4_VMXE);
+    const u64 cr0 = AdjustCr0(__readcr0());
+    __writecr0(cr0);
+
+    const u64 cr4 = AdjustCr4(__readcr4() | CR4_VMXE);
+    __writecr4(cr4);
 
     // vmxon
-    HvVmxOn(&vcpu->VmxOnPhys);
-
-    HvVmClear(&vcpu->VmcsPhys);
-    HvVmPtrLd(&vcpu->VmcsPhys);
-
-    // ensure setup respects the actual hardware state
-    if (!SetupVmcs(vcpu, _AddressOfReturnAddress(), reinterpret_cast<void*>(GuestStartThunk))) {
+    if (!VmxOk(HvVmxOn(&vcpu->VmxOnPhys))) {
+        DbgPrint("[HV] VMXON failed on core %u\n", id);
+        __writecr4(__readcr4() & ~CR4_VMXE);
         return 0;
     }
 
+    if (!VmxOk(HvVmClear(&vcpu->VmcsPhys))) {
+        DbgPrint("[HV] VMCLEAR failed on core %u\n", id);
+        HvVmxOff();
+        __writecr4(__readcr4() & ~CR4_VMXE);
+        return 0;
+    }
+
+    if (!VmxOk(HvVmPtrLd(&vcpu->VmcsPhys))) {
+        DbgPrint("[HV] VMPTRLD failed on core %u\n", id);
+        HvVmxOff();
+        __writecr4(__readcr4() & ~CR4_VMXE);
+        return 0;
+    }
+
+    // ensure setup respects the actual hardware state
+    if (!SetupVmcs(vcpu, _AddressOfReturnAddress(), reinterpret_cast<void*>(GuestStartThunk))) {
+        HvVmxOff();
+        __writecr4(__readcr4() & ~CR4_VMXE);
+        return 0;
+    }
+
+    vcpu->IsLaunched = true;
     // launch and check the returned rflags for failures
     u64 rflags = HvLaunchGuest();
+    vcpu->IsLaunched = false;
 
     // bit 0 (CF) means vmlaunch failed with no error code available
     // bit 6 (ZF) means vmlaunch failed with error code in VM_INSTRUCTION_ERROR
@@ -466,6 +603,24 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
 // ==============================================================================
 
 extern "C" NTSTATUS StartHypervisor() {
+    int regs[4] = {};
+    __cpuidex(regs, 0xD, 0);
+    u32 xsaveSize = static_cast<u32>(regs[1]);
+
+    if (xsaveSize > sizeof(GuestContext{}.FxArea)) {
+        DbgPrint("[HV] XSAVE area too small: need %u bytes, have %zu\n",
+                 xsaveSize, sizeof(GuestContext{}.FxArea));
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    {
+        UCHAR apcState[128] = {};
+
+        KeStackAttachProcess(reinterpret_cast<PRKPROCESS>(PsInitialSystemProcess), apcState);
+        g_HostCr3 = __readcr3();
+        KeUnstackDetachProcess(apcState);
+    }
+
     g_ProcessorCount = KeQueryActiveProcessorCount(nullptr);
 
     g_VcpuData = static_cast<VcpuContext*>(
@@ -507,6 +662,12 @@ extern "C" NTSTATUS StartHypervisor() {
     }
 
     KeIpiGenericCall(EnableHvCallback, 0);
+
+    u32 ok = 0;
+    for (u32 i = 0; i < g_ProcessorCount; i++) if (g_VcpuData[i].IsLaunched) ok++;
+    DbgPrint("[HV] Launched on %u/%u processors\n", ok, g_ProcessorCount);
+    if (ok == 0) { StopHypervisor(); return STATUS_NOT_SUPPORTED; }
+
     return STATUS_SUCCESS;
 }
 
